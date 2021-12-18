@@ -2,3 +2,9 @@ LICENSE       text
 .clang-format text
 
 *.sln         text
+*.vsxproj     text
+*.filters     text
+
+*.h           text
+*.c           text
+
