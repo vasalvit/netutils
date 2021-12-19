@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,10 @@ typedef struct _arguments_t {
 } arguments_t, *arguments_p;
 
 typedef struct _application_t {
+  void (*print_error)(const char *format, ...);
+  void (*print_info)(const char *format, ...);
+  void (*print_trace)(const char *format, ...);
+
   uv_loop_t loop;
   uv_signal_t sigint;
 } application_t, *application_p;
@@ -47,6 +52,9 @@ static bool parse_args(arguments_p args, int argc, char **argv);
 
 static void show_help(void);
 static void show_version(void);
+
+static void logger_print(const char *format, ...);
+static void logger_noop(const char *format, ...);
 
 static void sigint_handler(uv_signal_t *, int);
 static void sigint_closed(uv_handle_t *);
@@ -72,9 +80,15 @@ int main(int argc, char **argv) {
     return EXIT_SUCCESS;
   }
 
-  // init looop
+  // init logger
 
   application_t app = {0};
+
+  app.print_error = logger_print;
+  app.print_info = args.quiet_mode ? logger_noop : logger_print;
+  app.print_trace = args.quiet_mode ? logger_noop : (args.verbose_mode ? logger_print : logger_noop);
+
+  // init looop
 
   uv_loop_init(&app.loop);
 
@@ -86,7 +100,7 @@ int main(int argc, char **argv) {
 
   // start loop
 
-  printf("Press Ctrl+C to stop\n");
+  app.print_info("Press Ctrl+C to stop\n");
 
   uv_run(&app.loop, UV_RUN_DEFAULT);
 
@@ -100,8 +114,8 @@ int main(int argc, char **argv) {
   }
 
   if (UV_EBUSY == rc) {
-    printf("Found unclosed handles:\n");
-    uv_walk(&app.loop, dump_handle, NULL);
+    app.print_error("Found unclosed handles:\n");
+    uv_walk(&app.loop, dump_handle, &app);
   }
 
   return EXIT_SUCCESS;
@@ -186,7 +200,7 @@ static bool parse_args(arguments_p args, int argc, char **argv) {
 
     else if (0 == strcmp(arg, "-q") || 0 == strcmp(arg, "--quiet")) {
       args->quiet_mode = true;
-    } else if (0 == strcmp(arg, "-v") || 0 == strcmp(arg, "--version")) {
+    } else if (0 == strcmp(arg, "-v") || 0 == strcmp(arg, "--verbose")) {
       args->verbose_mode = true;
     }
 
@@ -306,13 +320,28 @@ static bool parse_args(arguments_p args, int argc, char **argv) {
   return parsed;
 }
 
+static void logger_print(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+
+  vprintf_s(format, args);
+
+  va_end(args);
+}
+
+static void logger_noop(const char *format, ...) {
+  (void)format;
+
+  // do nothing
+}
+
 static void sigint_handler(uv_signal_t *sigint, int signum) {
   (void)signum;
 
   application_p app = (application_p)uv_handle_get_data((uv_handle_t *)sigint);
   assert(NULL != app);
 
-  printf("Interrupted...\n");
+  app->print_trace("Interrupted...\n");
 
   uv_signal_stop(&app->sigint);
   uv_close((uv_handle_t *)&app->sigint, sigint_closed);
@@ -327,18 +356,18 @@ static void sigint_closed(uv_handle_t *sigint) {
 }
 
 static void dump_handle(uv_handle_t *handle, void *data) {
-  (void)data;
+  application_p app = (application_p)data;
 
 #define XX(uc, lc)                                                                                                             \
   case UV_##uc:                                                                                                                \
-    printf("  Unclosed handle %s\n", #uc);                                                                                     \
+    app->print_error("  Unclosed handle %s\n", #uc);                                                                           \
     break;
 
   switch (handle->type) {
     UV_HANDLE_TYPE_MAP(XX)
 
   default:
-    printf("  Unknown unclosed handle type\n");
+    app->print_error("  Unknown unclosed handle type\n");
     break;
   }
 
