@@ -26,6 +26,9 @@
 #define MINIMAL_WORKERS 1
 #define MAXIMAL_WORKERS 1024
 
+#undef countof
+#define countof(_x) (sizeof((_x)) / sizeof((_x)[0]))
+
 typedef struct _arguments_t *arguments_p;
 typedef struct _application_t *application_p;
 typedef struct _worker_t *worker_p;
@@ -37,6 +40,7 @@ typedef struct _arguments_t {
   bool quiet_mode;
   bool verbose_mode;
 
+  bool is_ipv4;
   const char *address;
   int port_min, port_max;
   int size_min, size_max;
@@ -62,6 +66,12 @@ typedef struct _application_t {
   size_t workers_count;
 } application_t;
 
+typedef union _sockaddr_any {
+  struct sockaddr addr;
+  struct sockaddr_in addr4;
+  struct sockaddr_in6 addr6;
+} sockaddr_any;
+
 typedef struct _worker_t {
   int index;
   application_p app;
@@ -69,6 +79,17 @@ typedef struct _worker_t {
 
   uv_async_t async;
   uv_timer_t timer;
+
+  sockaddr_any sockaddr;
+  char address[256];
+  char port[16];
+
+  uv_udp_t socket;
+  uv_udp_send_t send_request;
+  uv_getaddrinfo_t addr_request;
+
+  uint8_t datagram[MAXIMAL_SIZE];
+  uv_buf_t buf;
 } worker_t;
 
 static bool parse_args(arguments_p args, int argc, char **argv);
@@ -90,12 +111,14 @@ static void worker_stop(worker_p worker);
 
 static void worker_timeout(uv_timer_t *timer);
 static void worker_send(uv_async_t *async);
+static void worker_addr_completed(uv_getaddrinfo_t *req, int status, struct addrinfo *res);
+static void worker_send_completed(uv_udp_send_t *req, int status);
+
+static unsigned int random(void);
 
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
-
-  // parse arguments
 
   arguments_t args = {0};
   if (!parse_args(&args, argc, argv)) {
@@ -110,23 +133,17 @@ int main(int argc, char **argv) {
     return EXIT_SUCCESS;
   }
 
-  // init application
-
   application_t app = {0};
 
   app.print_error = logger_print;
   app.print_info = args.quiet_mode ? logger_noop : logger_print;
   app.print_trace = args.quiet_mode ? logger_noop : (args.verbose_mode ? logger_print : logger_noop);
 
-  // init loop
-
   int rc = uv_loop_init(&app.loop);
   if (rc) {
     app.print_error("uv_loop_init failed: %s\n", uv_strerror(rc));
     return EXIT_FAILURE;
   }
-
-  // init stats timer
 
   rc = uv_timer_init(&app.loop, &app.stats_timer);
   if (rc) {
@@ -143,8 +160,6 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  // start workers
-
   app.workers_count = (size_t)args.workers_count;
 
   app.workers = (worker_p)calloc(app.workers_count, sizeof(*app.workers));
@@ -160,8 +175,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  // init Ctrl+C handler
-
   rc = uv_signal_init(&app.loop, &app.sigint);
   if (rc) {
     app.print_error("uv_signal_init failed: %s\n", uv_strerror(rc));
@@ -176,19 +189,13 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  // start loop
-
   app.print_info("Press Ctrl+C to stop\n");
 
   uv_run(&app.loop, UV_RUN_DEFAULT);
 
-  // stop workers
-
   for (worker_index = 0; worker_index < app.workers_count; ++worker_index) {
     worker_stop(&app.workers[worker_index]);
   }
-
-  // stop loop
 
   uv_close((uv_handle_t *)&app.stats_timer, handle_closed);
 
@@ -204,8 +211,6 @@ int main(int argc, char **argv) {
     app.print_error("Found unclosed handles:\n");
     uv_walk(&app.loop, dump_handle, &app);
   }
-
-  // term application
 
   free(app.workers);
 
@@ -240,10 +245,12 @@ static void show_help(void) {
   printf("\n");
 
   printf("Notes:\n");
-  printf("  * Destination address could have '%%d' symbols, in this case a random number will be used in this position\n");
+  printf("  * Destination address could have '*' symbols, in this case a random number will be used in this position\n");
   printf("  * Destination address could be IPv4 (with dots) or IPv6 (with colons)\n");
   printf("  * `--port-min` and `--port-max` could be used to randomize the destination port\n");
   printf("  * `--size-min` and `--size-max` could be used to randomize the datagram size\n");
+  printf("  * Application sends random data, do not use a port if someone is listening to it\n");
+  printf("  * Worker stops on the first error\n");
   printf("\n");
 
   printf("Defaults:\n");
@@ -406,6 +413,16 @@ static bool parse_args(arguments_p args, int argc, char **argv) {
       printf("Invalid workers count %d\n", args->workers_count);
       parsed = false;
     }
+
+    bool is_ipv4 = strchr(args->address, '.');
+    bool is_ipv6 = strchr(args->address, ':');
+
+    if ((!is_ipv4 && !is_ipv6) || (is_ipv4 && is_ipv6)) {
+      printf("Invalid address %s, IPv4 or IPv6 address is required\n", args->address);
+      parsed = false;
+    }
+
+    args->is_ipv4 = is_ipv4;
   }
 
   return parsed;
@@ -479,9 +496,7 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
   worker->app = app;
   worker->args = args;
 
-  // initialize async
-
-  int rc = uv_async_init(&app->loop, &worker->async, worker_send);
+  int rc = uv_async_init(&worker->app->loop, &worker->async, worker_send);
   if (rc) {
     worker->app->print_error("#%d: uv_async_init failed: %s\n", worker->index, uv_strerror(rc));
     return false;
@@ -489,9 +504,7 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
 
   uv_handle_set_data((uv_handle_t *)&worker->async, worker);
 
-  // initialize timer
-
-  rc = uv_timer_init(&app->loop, &worker->timer);
+  rc = uv_timer_init(&worker->app->loop, &worker->timer);
   if (rc) {
     worker->app->print_error("#%d: uv_timer_init failed: %s\n", worker->index, uv_strerror(rc));
     return false;
@@ -499,7 +512,13 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
 
   uv_handle_set_data((uv_handle_t *)&worker->timer, worker);
 
-  // start worker
+  rc = uv_udp_init(&worker->app->loop, &worker->socket);
+  if (rc) {
+    worker->app->print_error("#%d: uv_udp_init failed: %s\n", worker->index, uv_strerror(rc));
+    return false;
+  }
+
+  uv_handle_set_data((uv_handle_t *)&worker->socket, worker);
 
   rc = uv_async_send(&worker->async);
   if (rc) {
@@ -515,6 +534,10 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
 static void worker_stop(worker_p worker) {
   uv_close((uv_handle_t *)&worker->async, handle_closed);
   uv_close((uv_handle_t *)&worker->timer, handle_closed);
+  uv_close((uv_handle_t *)&worker->socket, handle_closed);
+
+  uv_cancel((uv_req_t *)&worker->send_request);
+  uv_cancel((uv_req_t *)&worker->addr_request);
 
   worker->app->print_trace("#%d: Worker stopped\n", worker->index);
 }
@@ -522,14 +545,147 @@ static void worker_stop(worker_p worker) {
 static void worker_send(uv_async_t *async) {
   worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)async);
 
-  worker->app->print_info("#%d: TODO: Send data\n", worker->index);
+  worker->address[0] = 0;
+
+  const char *address = worker->args->address;
+  while (*address) {
+    const char *ptr = strchr(address, '*');
+    if (!ptr) {
+      strcat_s(worker->address, sizeof(worker->address), address);
+      break;
+    }
+
+    if (address != ptr) {
+      strncat_s(worker->address, sizeof(worker->address), address, ptr - address);
+    }
+
+    char buffer[10];
+    if (worker->args->is_ipv4) {
+      sprintf_s(buffer, countof(buffer), "%d", random() % 256);
+    } else {
+      sprintf_s(buffer, countof(buffer), "%04x", random() % 65536);
+    }
+
+    strcat_s(worker->address, sizeof(worker->address), buffer);
+
+    address = ptr + 1;
+  }
+
+  if (worker->args->port_min == worker->args->port_max) {
+    sprintf_s(worker->port, countof(worker->port), "%d", worker->args->port_min);
+  } else {
+    sprintf_s(worker->port, countof(worker->port), "%d",
+              worker->args->port_min + random() % (worker->args->port_max - worker->args->port_min + 1));
+  }
+
+  struct addrinfo hints = {0};
+  hints.ai_family = worker->args->is_ipv4 ? AF_INET : AF_INET6;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_flags = AI_CANONNAME;
+
+  int rc =
+      uv_getaddrinfo(&worker->app->loop, &worker->addr_request, worker_addr_completed, worker->address, worker->port, &hints);
+  if (rc) {
+    worker->app->print_info("#%d: uv_getaddrinfo(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
+                            uv_strerror(rc));
+    return;
+  }
+
+  uv_req_set_data((uv_req_t *)&worker->addr_request, worker);
 }
 
 static void worker_timeout(uv_timer_t *timer) {
   worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)timer);
 
+  uv_timer_stop(&worker->timer);
+
   int rc = uv_async_send(&worker->async);
   if (rc) {
     worker->app->print_error("#%d: uv_async_send failed: %s\n", worker->index, uv_strerror(rc));
+    return;
   }
+}
+
+static void worker_addr_completed(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
+  worker_p worker = (worker_p)uv_req_get_data((uv_req_t *)req);
+
+  if (status) {
+    worker->app->print_info("#%d: uv_getaddrinfo(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
+                            uv_strerror(status));
+    return;
+  }
+
+  if (!res) {
+    worker->app->print_info("#%d: uv_getaddrinfo(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
+                            uv_strerror(UV_EINVAL));
+    return;
+  }
+
+  memcpy_s(&worker->sockaddr, sizeof(worker->sockaddr), res->ai_addr, res->ai_addrlen);
+
+  uv_freeaddrinfo(res);
+
+  int size = (worker->args->size_min == worker->args->size_max)
+                 ? (worker->args->size_min)
+                 : (worker->args->size_min + random() % (worker->args->size_max - worker->args->size_min + 1));
+
+  int index = 0;
+  for (index = 0; index < size; ++index) {
+    worker->datagram[index] = random() % 256;
+  }
+
+  worker->buf.base = (char *)worker->datagram;
+  worker->buf.len = size;
+
+  worker->app->print_trace("#%d: Send %d bytes to %s %s\n", worker->index, worker->buf.len, worker->address, worker->port);
+
+  int rc = uv_udp_send(&worker->send_request, &worker->socket, &worker->buf, 1, &worker->sockaddr.addr, worker_send_completed);
+  if (rc) {
+    worker->app->print_error("#%d: uv_udp_send(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
+                             uv_strerror(rc));
+    return;
+  }
+
+  uv_req_set_data((uv_req_t *)&worker->send_request, worker);
+}
+
+static void worker_send_completed(uv_udp_send_t *req, int status) {
+  worker_p worker = (worker_p)uv_req_get_data((uv_req_t *)req);
+
+  if (status) {
+    worker->app->print_info("#%d: uv_udp_send(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
+                            uv_strerror(status));
+    return;
+  }
+
+  worker->app->sent_operations++;
+  worker->app->sent_bytes += worker->buf.len;
+
+  if (0 == worker->args->timeout_ms) {
+    int rc = uv_async_send(&worker->async);
+    if (rc) {
+      worker->app->print_error("#%d: uv_async_send failed: %s\n", worker->index, uv_strerror(rc));
+      return;
+    }
+  } else {
+    int rc = uv_timer_start(&worker->timer, worker_timeout, worker->args->timeout_ms, 0);
+    if (rc) {
+      worker->app->print_error("#%d: uv_timer_start failed: %s\n", worker->index, uv_strerror(rc));
+      return;
+    }
+  }
+}
+
+static unsigned int random(void) {
+  static unsigned int v = 0, u = 0;
+
+  if (0 == v && 0 == u) {
+    v = (unsigned int)(uintptr_t)uv_os_getpid();
+    u = (unsigned int)(uintptr_t)uv_hrtime();
+  }
+
+  v = 36969 * (v & 65535) + (v >> 16);
+  u = 18000 * (u & 65535) + (u >> 16);
+
+  return (v << 16) + (u & 65535);
 }
