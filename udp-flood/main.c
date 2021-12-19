@@ -1,6 +1,8 @@
 #include <assert.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <uv.h>
@@ -51,6 +53,11 @@ typedef struct _application_t {
   uv_loop_t loop;
   uv_signal_t sigint;
 
+  uint64_t start_ns;
+  uint64_t sent_bytes;
+  uint64_t sent_operations;
+  uv_timer_t stats_timer;
+
   worker_p workers;
   size_t workers_count;
 } application_t;
@@ -61,6 +68,7 @@ typedef struct _worker_t {
   arguments_p args;
 
   uv_async_t async;
+  uv_timer_t timer;
 } worker_t;
 
 static bool parse_args(arguments_p args, int argc, char **argv);
@@ -71,16 +79,17 @@ static void show_version(void);
 static void logger_print(const char *format, ...);
 static void logger_noop(const char *format, ...);
 
-static void sigint_handler(uv_signal_t *, int);
+static void sigint_handler(uv_signal_t *sigint, int signum);
 
-static void handle_closed(uv_handle_t *);
-
-static void dump_handle(uv_handle_t *, void *);
+static void handle_closed(uv_handle_t *handle);
+static void dump_handle(uv_handle_t *handle, void *data);
+static void print_stats(uv_timer_t *timer);
 
 static bool worker_start(worker_p worker, int index, application_p app, arguments_p args);
 static void worker_stop(worker_p worker);
 
-static void worker_send(uv_async_t *handle);
+static void worker_timeout(uv_timer_t *timer);
+static void worker_send(uv_async_t *async);
 
 int main(int argc, char **argv) {
   (void)argc;
@@ -114,6 +123,23 @@ int main(int argc, char **argv) {
   int rc = uv_loop_init(&app.loop);
   if (rc) {
     app.print_error("uv_loop_init failed: %s\n", uv_strerror(rc));
+    return EXIT_FAILURE;
+  }
+
+  // init stats timer
+
+  rc = uv_timer_init(&app.loop, &app.stats_timer);
+  if (rc) {
+    app.print_error("uv_timer_init failed: %s\n", uv_strerror(rc));
+    return EXIT_FAILURE;
+  }
+
+  uv_handle_set_data((uv_handle_t *)&app.stats_timer, &app);
+
+  app.start_ns = uv_hrtime();
+  rc = uv_timer_start(&app.stats_timer, print_stats, 1 * 1000, 1 * 1000);
+  if (rc) {
+    app.print_error("uv_timer_start failed: %s\n", uv_strerror(rc));
     return EXIT_FAILURE;
   }
 
@@ -163,6 +189,8 @@ int main(int argc, char **argv) {
   }
 
   // stop loop
+
+  uv_close((uv_handle_t *)&app.stats_timer, handle_closed);
 
   rc = uv_loop_close(&app.loop);
 
@@ -437,6 +465,15 @@ static void dump_handle(uv_handle_t *handle, void *data) {
 #undef XX
 }
 
+static void print_stats(uv_timer_t *timer) {
+  application_p app = (application_p)uv_handle_get_data((uv_handle_t *)timer);
+
+  uint64_t elapsed_ns = uv_hrtime() - app->start_ns;
+
+  app->print_info("Elapsed %" PRIu64 " ms, sent %" PRIu64 " bytes in %" PRIu64 " operations\n", elapsed_ns / (1 * 1000 * 1000),
+                  app->sent_bytes, app->sent_operations);
+}
+
 static bool worker_start(worker_p worker, int index, application_p app, arguments_p args) {
   worker->index = index;
   worker->app = app;
@@ -446,17 +483,27 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
 
   int rc = uv_async_init(&app->loop, &worker->async, worker_send);
   if (rc) {
-    app->print_error("#%d: uv_async_init failed: %s\n", worker->index, uv_strerror(rc));
+    worker->app->print_error("#%d: uv_async_init failed: %s\n", worker->index, uv_strerror(rc));
     return false;
   }
 
   uv_handle_set_data((uv_handle_t *)&worker->async, worker);
 
+  // initialize timer
+
+  rc = uv_timer_init(&app->loop, &worker->timer);
+  if (rc) {
+    worker->app->print_error("#%d: uv_timer_init failed: %s\n", worker->index, uv_strerror(rc));
+    return false;
+  }
+
+  uv_handle_set_data((uv_handle_t *)&worker->timer, worker);
+
   // start worker
 
   rc = uv_async_send(&worker->async);
   if (rc) {
-    app->print_error("#%d: uv_async_send failed: %s\n", worker->index, uv_strerror(rc));
+    worker->app->print_error("#%d: uv_async_send failed: %s\n", worker->index, uv_strerror(rc));
     return false;
   }
 
@@ -467,12 +514,22 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
 
 static void worker_stop(worker_p worker) {
   uv_close((uv_handle_t *)&worker->async, handle_closed);
+  uv_close((uv_handle_t *)&worker->timer, handle_closed);
 
   worker->app->print_trace("#%d: Worker stopped\n", worker->index);
 }
 
-static void worker_send(uv_async_t *handle) {
-  worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)handle);
+static void worker_send(uv_async_t *async) {
+  worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)async);
 
   worker->app->print_info("#%d: TODO: Send data\n", worker->index);
+}
+
+static void worker_timeout(uv_timer_t *timer) {
+  worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)timer);
+
+  int rc = uv_async_send(&worker->async);
+  if (rc) {
+    worker->app->print_error("#%d: uv_async_send failed: %s\n", worker->index, uv_strerror(rc));
+  }
 }
