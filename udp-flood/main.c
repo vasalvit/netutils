@@ -24,6 +24,10 @@
 #define MINIMAL_WORKERS 1
 #define MAXIMAL_WORKERS 1024
 
+typedef struct _arguments_t *arguments_p;
+typedef struct _application_t *application_p;
+typedef struct _worker_t *worker_p;
+
 typedef struct _arguments_t {
   bool show_help;
   bool show_version;
@@ -37,7 +41,7 @@ typedef struct _arguments_t {
 
   int timeout_ms;
   int workers_count;
-} arguments_t, *arguments_p;
+} arguments_t;
 
 typedef struct _application_t {
   void (*print_error)(const char *format, ...);
@@ -46,7 +50,18 @@ typedef struct _application_t {
 
   uv_loop_t loop;
   uv_signal_t sigint;
-} application_t, *application_p;
+
+  worker_p workers;
+  size_t workers_count;
+} application_t;
+
+typedef struct _worker_t {
+  int index;
+  application_p app;
+  arguments_p args;
+
+  uv_async_t async;
+} worker_t;
 
 static bool parse_args(arguments_p args, int argc, char **argv);
 
@@ -57,9 +72,15 @@ static void logger_print(const char *format, ...);
 static void logger_noop(const char *format, ...);
 
 static void sigint_handler(uv_signal_t *, int);
-static void sigint_closed(uv_handle_t *);
+
+static void handle_closed(uv_handle_t *);
 
 static void dump_handle(uv_handle_t *, void *);
+
+static bool worker_start(worker_p worker, int index, application_p app, arguments_p args);
+static void worker_stop(worker_p worker);
+
+static void worker_send(uv_async_t *handle);
 
 int main(int argc, char **argv) {
   (void)argc;
@@ -80,7 +101,7 @@ int main(int argc, char **argv) {
     return EXIT_SUCCESS;
   }
 
-  // init logger
+  // init application
 
   application_t app = {0};
 
@@ -88,15 +109,46 @@ int main(int argc, char **argv) {
   app.print_info = args.quiet_mode ? logger_noop : logger_print;
   app.print_trace = args.quiet_mode ? logger_noop : (args.verbose_mode ? logger_print : logger_noop);
 
-  // init looop
+  // init loop
 
-  uv_loop_init(&app.loop);
+  int rc = uv_loop_init(&app.loop);
+  if (rc) {
+    app.print_error("uv_loop_init failed: %s\n", uv_strerror(rc));
+    return EXIT_FAILURE;
+  }
+
+  // start workers
+
+  app.workers_count = (size_t)args.workers_count;
+
+  app.workers = (worker_p)calloc(app.workers_count, sizeof(*app.workers));
+  if (!app.workers) {
+    app.print_error("Not enough memory for workers\n");
+    return EXIT_FAILURE;
+  }
+
+  size_t worker_index = 0;
+  for (worker_index = 0; worker_index < app.workers_count; ++worker_index) {
+    if (!worker_start(&app.workers[worker_index], (int)worker_index + 1, &app, &args)) {
+      return EXIT_FAILURE;
+    }
+  }
 
   // init Ctrl+C handler
 
-  uv_signal_init(&app.loop, &app.sigint);
+  rc = uv_signal_init(&app.loop, &app.sigint);
+  if (rc) {
+    app.print_error("uv_signal_init failed: %s\n", uv_strerror(rc));
+    return EXIT_FAILURE;
+  }
+
   uv_handle_set_data((uv_handle_t *)&app.sigint, &app);
-  uv_signal_start(&app.sigint, (uv_signal_cb)sigint_handler, SIGINT);
+
+  rc = uv_signal_start(&app.sigint, sigint_handler, SIGINT);
+  if (rc) {
+    app.print_error("uv_signal_start failed: %s\n", uv_strerror(rc));
+    return EXIT_FAILURE;
+  }
 
   // start loop
 
@@ -104,11 +156,18 @@ int main(int argc, char **argv) {
 
   uv_run(&app.loop, UV_RUN_DEFAULT);
 
+  // stop workers
+
+  for (worker_index = 0; worker_index < app.workers_count; ++worker_index) {
+    worker_stop(&app.workers[worker_index]);
+  }
+
   // stop loop
 
-  int rc = uv_loop_close(&app.loop);
-  int i = 0;
-  for (i = 0; UV_EBUSY == rc && i < 1000; ++i) {
+  rc = uv_loop_close(&app.loop);
+
+  int retry = 0;
+  for (retry = 0; UV_EBUSY == rc && retry < 1000; ++retry) {
     uv_run(&app.loop, UV_RUN_NOWAIT);
     rc = uv_loop_close(&app.loop);
   }
@@ -117,6 +176,10 @@ int main(int argc, char **argv) {
     app.print_error("Found unclosed handles:\n");
     uv_walk(&app.loop, dump_handle, &app);
   }
+
+  // term application
+
+  free(app.workers);
 
   return EXIT_SUCCESS;
 }
@@ -344,12 +407,12 @@ static void sigint_handler(uv_signal_t *sigint, int signum) {
   app->print_trace("Interrupted...\n");
 
   uv_signal_stop(&app->sigint);
-  uv_close((uv_handle_t *)&app->sigint, sigint_closed);
+  uv_close((uv_handle_t *)&app->sigint, handle_closed);
 
   uv_stop(&app->loop);
 }
 
-static void sigint_closed(uv_handle_t *sigint) {
+static void handle_closed(uv_handle_t *sigint) {
   (void)sigint;
 
   // do nothing
@@ -372,4 +435,44 @@ static void dump_handle(uv_handle_t *handle, void *data) {
   }
 
 #undef XX
+}
+
+static bool worker_start(worker_p worker, int index, application_p app, arguments_p args) {
+  worker->index = index;
+  worker->app = app;
+  worker->args = args;
+
+  // initialize async
+
+  int rc = uv_async_init(&app->loop, &worker->async, worker_send);
+  if (rc) {
+    app->print_error("#%d: uv_async_init failed: %s\n", worker->index, uv_strerror(rc));
+    return false;
+  }
+
+  uv_handle_set_data((uv_handle_t *)&worker->async, worker);
+
+  // start worker
+
+  rc = uv_async_send(&worker->async);
+  if (rc) {
+    app->print_error("#%d: uv_async_send failed: %s\n", worker->index, uv_strerror(rc));
+    return false;
+  }
+
+  worker->app->print_trace("#%d: Worker started\n", worker->index);
+
+  return true;
+}
+
+static void worker_stop(worker_p worker) {
+  uv_close((uv_handle_t *)&worker->async, handle_closed);
+
+  worker->app->print_trace("#%d: Worker stopped\n", worker->index);
+}
+
+static void worker_send(uv_async_t *handle) {
+  worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)handle);
+
+  worker->app->print_info("#%d: TODO: Send data\n", worker->index);
 }
