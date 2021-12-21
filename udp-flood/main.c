@@ -40,6 +40,8 @@ typedef struct _arguments_t {
   bool quiet_mode;
   bool verbose_mode;
 
+  bool raw_stats;
+
   bool is_ipv4;
   const char *address;
   int port_min, port_max;
@@ -54,12 +56,17 @@ typedef struct _application_t {
   void (*print_info)(const char *format, ...);
   void (*print_trace)(const char *format, ...);
 
+  arguments_t args;
+
   uv_loop_t loop;
   uv_signal_t sigint;
 
   uint64_t start_ns;
+  uint64_t prev_ns;
   uint64_t sent_bytes;
   uint64_t sent_operations;
+  uint64_t prev_sent_bytes;
+  uint64_t prev_sent_operations;
   uv_timer_t stats_timer;
 
   worker_p workers;
@@ -120,24 +127,23 @@ int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
-  arguments_t args = {0};
-  if (!parse_args(&args, argc, argv)) {
+  application_t app = {0};
+
+  if (!parse_args(&app.args, argc, argv)) {
     return EXIT_FAILURE;
   }
 
-  if (args.show_help) {
+  if (app.args.show_help) {
     show_help();
     return EXIT_SUCCESS;
-  } else if (args.show_version) {
+  } else if (app.args.show_version) {
     show_version();
     return EXIT_SUCCESS;
   }
 
-  application_t app = {0};
-
   app.print_error = logger_print;
-  app.print_info = args.quiet_mode ? logger_noop : logger_print;
-  app.print_trace = args.quiet_mode ? logger_noop : (args.verbose_mode ? logger_print : logger_noop);
+  app.print_info = app.args.quiet_mode ? logger_noop : logger_print;
+  app.print_trace = app.args.quiet_mode ? logger_noop : (app.args.verbose_mode ? logger_print : logger_noop);
 
   int rc = uv_loop_init(&app.loop);
   if (rc) {
@@ -153,14 +159,14 @@ int main(int argc, char **argv) {
 
   uv_handle_set_data((uv_handle_t *)&app.stats_timer, &app);
 
-  app.start_ns = uv_hrtime();
+  app.start_ns = app.prev_ns = uv_hrtime();
   rc = uv_timer_start(&app.stats_timer, print_stats, 1 * 1000, 1 * 1000);
   if (rc) {
     app.print_error("uv_timer_start failed: %s\n", uv_strerror(rc));
     return EXIT_FAILURE;
   }
 
-  app.workers_count = (size_t)args.workers_count;
+  app.workers_count = (size_t)app.args.workers_count;
 
   app.workers = (worker_p)calloc(app.workers_count, sizeof(*app.workers));
   if (!app.workers) {
@@ -170,7 +176,7 @@ int main(int argc, char **argv) {
 
   size_t worker_index = 0;
   for (worker_index = 0; worker_index < app.workers_count; ++worker_index) {
-    if (!worker_start(&app.workers[worker_index], (int)worker_index + 1, &app, &args)) {
+    if (!worker_start(&app.workers[worker_index], (int)worker_index + 1, &app, &app.args)) {
       return EXIT_FAILURE;
     }
   }
@@ -228,8 +234,9 @@ static void show_help(void) {
   printf("\n");
 
   printf("Logging options:\n");
-  printf("    -v, --verbose    Verbose mode\n");
-  printf("    -q, --quiet      Quiet mode\n");
+  printf("    -v, --verbose      Verbose mode\n");
+  printf("    -q, --quiet        Quiet mode\n");
+  printf("        --raw-stats    Do not convert stats to minutes and Gbytes\n");
   printf("\n");
 
   printf("Flood options:\n");
@@ -300,6 +307,8 @@ static bool parse_args(arguments_p args, int argc, char **argv) {
       args->quiet_mode = true;
     } else if (0 == strcmp(arg, "-v") || 0 == strcmp(arg, "--verbose")) {
       args->verbose_mode = true;
+    } else if (0 == strcmp(arg, "--raw-stats")) {
+      args->raw_stats = true;
     }
 
     else if (0 == strcmp(arg, "-a") || 0 == strcmp(arg, "--address")) {
@@ -482,13 +491,86 @@ static void dump_handle(uv_handle_t *handle, void *data) {
 #undef XX
 }
 
+static void humanize_time(char *buffer, size_t buffer_length, uint64_t time_ns) {
+  uint64_t time_sec = (time_ns / 1000000 + 500) / 1000;
+
+  uint64_t seconds = time_sec % 60;
+  uint64_t minutes = time_sec / 60 % 60;
+  uint64_t hours = time_sec / 3600;
+
+  sprintf_s(buffer, buffer_length, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, hours, minutes, seconds);
+}
+
+static void humanize_bytes(char *buffer, size_t buffer_length, uint64_t bytes) {
+  if (bytes < 768ull) {
+    sprintf_s(buffer, buffer_length, "%" PRIu64 " bytes", bytes);
+  } else if (bytes < 768ull * 1024) {
+    sprintf_s(buffer, buffer_length, "%.2f KiB", bytes / 1024.0f);
+  } else if (bytes < 768ull * 1024 * 1024) {
+    sprintf_s(buffer, buffer_length, "%.2f MiB", bytes / (1024.0f * 1024.0f));
+  } else if (bytes < 768ull * 1024 * 1024 * 1024) {
+    sprintf_s(buffer, buffer_length, "%.2f GiB", bytes / (1024.0f * 1024.0f * 1024.0f));
+  } else if (bytes < 768ull * 1024 * 1024 * 1024 * 1024) {
+    sprintf_s(buffer, buffer_length, "%.2f TiB", bytes / (1024.0f * 1024.0f * 1024.0f * 1024.0f));
+  } else {
+    sprintf_s(buffer, buffer_length, "%.2f PiB", bytes / (1024.0f * 1024.0f * 1024.0f * 1024.0f * 1024.0f));
+  }
+}
+
+static void humanize_operations(char *buffer, size_t buffer_length, uint64_t operations) {
+  if (operations < 700ull) {
+    sprintf_s(buffer, buffer_length, "%" PRIu64 " operations", operations);
+  } else if (operations < 700ull * 1000) {
+    sprintf_s(buffer, buffer_length, "%.2f Kop", operations / 1.0E3f);
+  } else if (operations < 700ull * 1000 * 1000) {
+    sprintf_s(buffer, buffer_length, "%.2f Mop", operations / 1.0E6f);
+  } else if (operations < 700ull * 1000 * 1000 * 1000) {
+    sprintf_s(buffer, buffer_length, "%.2f Gop", operations / 1.0E9f);
+  } else if (operations < 700ull * 1000 * 1000 * 1000 * 1000) {
+    sprintf_s(buffer, buffer_length, "%.2f Top", operations / 1.0E12f);
+  } else {
+    sprintf_s(buffer, buffer_length, "%.2f Pop", operations / 1.0E15f);
+  }
+}
+
 static void print_stats(uv_timer_t *timer) {
   application_p app = (application_p)uv_handle_get_data((uv_handle_t *)timer);
 
-  uint64_t elapsed_ns = uv_hrtime() - app->start_ns;
+  uint64_t time_ns = uv_hrtime();
+  uint64_t total_ns = time_ns - app->start_ns;
+  app->prev_ns = time_ns;
 
-  app->print_info("Elapsed %" PRIu64 " ms, sent %" PRIu64 " bytes in %" PRIu64 " operations\n", elapsed_ns / (1 * 1000 * 1000),
-                  app->sent_bytes, app->sent_operations);
+  uint64_t total_bytes = app->sent_bytes;
+  uint64_t tick_bytes = app->sent_bytes - app->prev_sent_bytes;
+  app->prev_sent_bytes = total_bytes;
+
+  uint64_t total_operations = app->sent_operations;
+  uint64_t tick_operations = app->sent_operations - app->prev_sent_operations;
+  app->prev_sent_operations = total_operations;
+
+  if (app->args.raw_stats) {
+    app->print_info("Elapsed %" PRIu64 " ms, %" PRIu64 " bytes/s and %" PRIu64 " op/s, total %" PRIu64 " bytes and %" PRIu64
+                    " operations\n",
+                    total_ns / (1 * 1000 * 1000), tick_bytes, tick_operations, total_bytes, total_operations);
+  } else {
+    char time_str[64] = {0};
+    humanize_time(time_str, countof(time_str), total_ns);
+
+    char total_bytes_str[64] = {0};
+    humanize_bytes(total_bytes_str, countof(total_bytes_str), total_bytes);
+
+    char total_operations_str[64] = {0};
+    humanize_operations(total_operations_str, countof(total_operations_str), total_operations);
+
+    char tick_bytes_str[64] = {0};
+    humanize_bytes(tick_bytes_str, countof(tick_bytes_str), tick_bytes);
+
+    char tick_operations_str[64] = {0};
+    humanize_operations(tick_operations_str, countof(tick_operations_str), tick_operations);
+
+    app->print_info("Elapsed %s, %s/s and %s/s, total %s and %s\n", time_str, tick_bytes_str, tick_operations_str,
+                    total_bytes_str, total_operations_str);
+  }
 }
 
 static bool worker_start(worker_p worker, int index, application_p app, arguments_p args) {
