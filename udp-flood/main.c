@@ -13,7 +13,7 @@
 
 #define DEFAULT_ADDRESS "127.0.0.1"
 #define DEFAULT_PORT 55555
-#define DEFAULT_SIZE 512
+#define DEFAULT_SIZE 4096
 #define DEFAULT_TIMEOUT 0
 #define DEFAULT_WORKERS 1
 
@@ -83,6 +83,8 @@ typedef struct _worker_t {
   int index;
   application_p app;
   arguments_p args;
+
+  bool stopped;
 
   uv_async_t async;
   uv_timer_t timer;
@@ -614,18 +616,24 @@ static bool worker_start(worker_p worker, int index, application_p app, argument
 }
 
 static void worker_stop(worker_p worker) {
-  uv_close((uv_handle_t *)&worker->async, handle_closed);
-  uv_close((uv_handle_t *)&worker->timer, handle_closed);
-  uv_close((uv_handle_t *)&worker->socket, handle_closed);
+  worker->stopped = true;
 
   uv_cancel((uv_req_t *)&worker->send_request);
   uv_cancel((uv_req_t *)&worker->addr_request);
+
+  uv_close((uv_handle_t *)&worker->async, handle_closed);
+  uv_close((uv_handle_t *)&worker->timer, handle_closed);
+  uv_close((uv_handle_t *)&worker->socket, handle_closed);
 
   worker->app->print_trace("#%d: Worker stopped\n", worker->index);
 }
 
 static void worker_send(uv_async_t *async) {
   worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)async);
+
+  if (worker->stopped) {
+    return;
+  }
 
   worker->address[0] = 0;
 
@@ -679,6 +687,10 @@ static void worker_send(uv_async_t *async) {
 static void worker_timeout(uv_timer_t *timer) {
   worker_p worker = (worker_p)uv_handle_get_data((uv_handle_t *)timer);
 
+  if (worker->stopped) {
+    return;
+  }
+
   uv_timer_stop(&worker->timer);
 
   int rc = uv_async_send(&worker->async);
@@ -691,13 +703,15 @@ static void worker_timeout(uv_timer_t *timer) {
 static void worker_addr_completed(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
   worker_p worker = (worker_p)uv_req_get_data((uv_req_t *)req);
 
+  if (worker->stopped) {
+    return;
+  }
+
   if (status) {
     worker->app->print_info("#%d: uv_getaddrinfo(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
                             uv_strerror(status));
     return;
-  }
-
-  if (!res) {
+  } else if (!res) {
     worker->app->print_info("#%d: uv_getaddrinfo(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
                             uv_strerror(UV_EINVAL));
     return;
@@ -733,6 +747,10 @@ static void worker_addr_completed(uv_getaddrinfo_t *req, int status, struct addr
 
 static void worker_send_completed(uv_udp_send_t *req, int status) {
   worker_p worker = (worker_p)uv_req_get_data((uv_req_t *)req);
+
+  if (worker->stopped) {
+    return;
+  }
 
   if (status) {
     worker->app->print_info("#%d: uv_udp_send(%s, %s) failed: %s\n", worker->index, worker->address, worker->port,
