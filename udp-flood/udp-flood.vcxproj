@@ -90,13 +90,14 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_CRTDBG_MAP_ALLOC;WIN32;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(SolutionDir)..\..\sources;$(VCPKG_ROOT)\installed\$(PlatformShortName)-windows-static\include</AdditionalIncludeDirectories>
       <DisableSpecificWarnings>5105</DisableSpecificWarnings>
+      <ForcedIncludeFiles>stdlib.h;crtdbg.h</ForcedIncludeFiles>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -133,13 +134,14 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_CRTDBG_MAP_ALLOC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(SolutionDir)..\..\sources;$(VCPKG_ROOT)\installed\$(PlatformShortName)-windows-static\include</AdditionalIncludeDirectories>
       <DisableSpecificWarnings>5105</DisableSpecificWarnings>
+      <ForcedIncludeFiles>stdlib.h;crtdbg.h</ForcedIncludeFiles>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -173,7 +175,20 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="logger.c" />
+    <ClCompile Include="loop.c" />
     <ClCompile Include="main.c" />
+    <ClCompile Include="random.c" />
+    <ClCompile Include="worker.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="atomic.h" />
+    <ClInclude Include="globals.h" />
+    <ClInclude Include="logger.h" />
+    <ClInclude Include="loop.h" />
+    <ClInclude Include="platform.h" />
+    <ClInclude Include="random.h" />
+    <ClInclude Include="worker.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
